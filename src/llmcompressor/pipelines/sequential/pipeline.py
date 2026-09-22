@@ -16,6 +16,12 @@ from torch.utils.data.dataloader import DataLoader
 from tqdm import tqdm
 
 from llmcompressor.core import LifecycleCallbacks, active_session
+from llmcompressor.modeling.moe.linearize import (
+    linearize_moe_model,
+    linearize_moe_subgraph,
+    repack_moe_model,
+    repack_moe_subgraph,
+)
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.pipelines.registry import CalibrationPipeline
@@ -153,6 +159,10 @@ class SequentialPipeline(CalibrationPipeline):
         with contextlib.ExitStack() as stack:
             stack.enter_context(calibration_forward_context(model))
             stack.enter_context(DisableQuantization(model))
+
+            # Linearize MoE layers upfront when lazy linearization is disabled.
+            if not dataset_args.moe_lazy_linearization_and_repack:
+                linearize_moe_model(model)
             # prepare intermediates cache
             activations = IntermediatesCache.from_dataloader(
                 dataloader, onload_device, offload_device
@@ -235,6 +245,9 @@ class SequentialPipeline(CalibrationPipeline):
                 #######################
                 offload_kwargs = subgraph_onload_modules(subgraph_modules)
 
+                if dataset_args.moe_lazy_linearization_and_repack:
+                    linearize_moe_subgraph(model, subgraph_modules)
+
                 if subgraph_index + 1 < num_subgraphs:
                     next_subgraph_modules = subgraphs[
                         subgraph_index + 1
@@ -282,6 +295,11 @@ class SequentialPipeline(CalibrationPipeline):
                             if dataset_args.propagate_error and has_next_subgraph:
                                 activations.update(batch_idx, output)
                                 activations.delete(batch_idx, subgraph.consumed_names)
+                if (
+                    dataset_args.moe_lazy_linearization_and_repack
+                    and dataset_args.repack_moe_layers
+                ):
+                    repack_moe_subgraph(model, subgraph_modules)
 
                             if seq_error_cache is not None and has_next_subgraph:
                                 batch_power = process_batch_error(
@@ -306,6 +324,12 @@ class SequentialPipeline(CalibrationPipeline):
                 #######################
                 #### END OF ONLOAD ####
                 #######################
+
+            if (
+                not dataset_args.moe_lazy_linearization_and_repack
+                and dataset_args.repack_moe_layers
+            ):
+                repack_moe_model(model)
 
             # redundant, finish any remaining compression
             LifecycleCallbacks.calibration_end()
